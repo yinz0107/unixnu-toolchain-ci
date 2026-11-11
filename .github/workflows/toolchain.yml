@@ -1,0 +1,113 @@
+name: toolchain
+
+# Builds the Linux toolchain that UniXNU's kernel step needs
+# (patched clang with __builtin_xnu_type_*, cctools-port ld64, mig, iig, lzfse)
+# and uploads it as a downloadable artifact.
+#
+# Why a runner and not a local machine: the LLVM build needs ~16 GB RAM and
+# tens of GB of disk. The target WSL here is Ubuntu 22.04 (glibc 2.35), so the
+# runner must be ubuntu-22.04 as well -- a 24.04 artifact would not run there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      unixnu_ref:
+        description: UniXNU ref to build the toolchain from
+        required: true
+        default: main
+      jobs:
+        description: Parallel build jobs (runner has 4 cores)
+        required: true
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  toolchain:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Show runner
+        run: |
+          lsb_release -a
+          ldd --version | head -1
+          nproc
+          free -h
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ inputs.unixnu_ref }}
+          path: UniXNU
+
+      - name: Record the ref
+        run: |
+          git -C UniXNU rev-parse HEAD > /tmp/unixnu-ref.txt
+          cat /tmp/unixnu-ref.txt
+
+      # setup-toolchain.py installs its own apt packages (--package-manager apt)
+      # and then builds: patched LLVM (commit pinned in the script), cctools-port,
+      # libdispatch, bootstrap_cmds (mig), iig-port, lzfse. It also drops the
+      # xcrun/plutil/codesign shims into /usr/bin, which xnu's makefiles expect.
+      - name: Build the toolchain
+        run: |
+          sudo python3 UniXNU/scripts/linux/setup-toolchain.py \
+            /opt/unixnu-linux \
+            --package-manager apt \
+            -j ${{ inputs.jobs }}
+
+      - name: Verify what was produced
+        run: |
+          set -x
+          /opt/unixnu-linux/llvm/bin/clang --version | head -2
+          ls /opt/unixnu-linux
+          ls /opt/unixnu-linux/CommandLineTools/usr/bin | head -20 || true
+          ls /opt/unixnu-linux/XcodeDefault.xctoolchain/usr/bin | head -10 || true
+          test -f /opt/unixnu-linux/bin/lzfse && echo "lzfse ok"
+          test -f /usr/bin/xcrun && echo "xcrun shim ok"
+          test -f /usr/bin/plutil && echo "plutil shim ok"
+          test -f /usr/bin/codesign && echo "codesign shim ok"
+          # the marker the kernel step looks for
+          echo '#if __has_builtin(__builtin_xnu_type_summary)
+          ok
+          #endif' > /tmp/t.c
+          /opt/unixnu-linux/llvm/bin/clang -fsyntax-only /tmp/t.c && echo "xnu builtins ok"
+
+      - name: Pack the prefix and the shims
+        run: |
+          sudo tar -C / -czf /tmp/unixnu-toolchain-ubuntu2204.tar.gz opt/unixnu-linux
+          SHA=$(git -C UniXNU rev-parse HEAD)
+          sudo tar -C / -czf /tmp/unixnu-shims.tar.gz \
+            usr/bin/xcrun usr/bin/plutil usr/bin/codesign 2>/dev/null || true
+          {
+            echo "unixnu ref: $SHA"
+            lsb_release -a 2>/dev/null
+            echo "glibc: $(ldd --version | head -1)"
+            echo "kernel: $(uname -r)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "## packages (subset)"
+            dpkg-query -W -f='${Package} ${Version}\n' \
+              clang llvm-dev libclang-dev cmake ninja-build libbsd-dev uuid-dev \
+              device-tree-compiler mtools 2>/dev/null
+            echo
+            echo "## prefix layout"
+            ls -la /opt/unixnu-linux
+            echo
+            echo "## shims in /usr/bin"
+            ls -l /usr/bin/xcrun /usr/bin/plutil /usr/bin/codesign 2>/dev/null || echo "none"
+          } > /tmp/toolchain-info.txt
+          ls -lh /tmp/*.tar.gz /tmp/toolchain-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unixnu-toolchain-ubuntu2204
+          path: |
+            /tmp/unixnu-toolchain-ubuntu2204.tar.gz
+            /tmp/unixnu-shims.tar.gz
+            /tmp/toolchain-info.txt
+            /tmp/unixnu-ref.txt
+          retention-days: 7
+          if-no-files-found: error
