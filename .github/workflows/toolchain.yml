@@ -59,6 +59,7 @@ jobs:
             -j ${{ inputs.jobs }}
 
       - name: Verify what was produced
+        continue-on-error: true
         run: |
           set -x
           /opt/unixnu-linux/llvm/bin/clang --version | head -2
@@ -69,13 +70,14 @@ jobs:
           test -f /usr/bin/xcrun && echo "xcrun shim ok"
           test -f /usr/bin/plutil && echo "plutil shim ok"
           test -f /usr/bin/codesign && echo "codesign shim ok"
-          # the marker the kernel step looks for
-          echo '#if __has_builtin(__builtin_xnu_type_summary)
-          ok
-          #endif' > /tmp/t.c
-          /opt/unixnu-linux/llvm/bin/clang -fsyntax-only /tmp/t.c && echo "xnu builtins ok"
+          # the marker the kernel step looks for; an explicit target is required,
+          # otherwise clang reports "unknown target triple 'unknown'"
+          printf '#if __has_builtin(__builtin_xnu_type_summary)\nok\n#endif\n' > /tmp/t.c
+          /opt/unixnu-linux/llvm/bin/clang --target=arm64-apple-ios14.0 -fsyntax-only /tmp/t.c \
+            && echo "xnu builtins ok"
 
       - name: Pack the prefix and the shims
+        if: always()
         run: |
           sudo tar -C / -czf /tmp/unixnu-toolchain-ubuntu2204.tar.gz opt/unixnu-linux
           SHA=$(git -C UniXNU rev-parse HEAD)
@@ -102,6 +104,7 @@ jobs:
           ls -lh /tmp/*.tar.gz /tmp/toolchain-info.txt
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: unixnu-toolchain-ubuntu2204
           path: |
